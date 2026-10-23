@@ -1,231 +1,224 @@
-import os
+import html
 import requests
 import xml.etree.ElementTree as ET
+from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor
 import streamlit as st
-from pypdf import PdfReader
-from llama_index.core import SimpleDirectoryReader, VectorStoreIndex, Settings
-from llama_index.llms.groq import Groq
-from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-from llama_index.core.node_parser import TokenTextSplitter
 
-# ---------------------------------------------------------------
-# 1. Credentials (set GROQ_API_KEY in Streamlit Cloud > Secrets)
-# ---------------------------------------------------------------
-if "GROQ_API_KEY" not in os.environ:
+AFFILIATE_TAG = "yourtrack-20"  # <- put your real Amazon tracking ID here
+COPYRIGHTED_TERMS = ["harry potter", "percy jackson", "lord of the rings", "hobbit",
+                     "stephen king", "twilight", "narnia"]
+UA = {"User-Agent": "BookHubApp/1.0"}
+
+st.set_page_config(page_title="The Book Hub", page_icon="📖", layout="centered")
+
+CSS = """
+<style>
+.stApp{background:radial-gradient(circle at 50% 0%,#4a3321,#160e08 80%)}
+#MainMenu,footer{visibility:hidden}
+.block-container{max-width:780px;padding-top:2rem}
+[data-testid="stForm"]{background:linear-gradient(145deg,#6b3a1f,#3e2012 60%,#2a150a);
+ border:3px solid #d4a94a;border-radius:6px 18px 18px 6px;padding:3rem 2.2rem;
+ box-shadow:inset 0 0 0 8px #3e2012,inset 0 0 0 10px #d4a94a,14px 16px 30px rgba(0,0,0,.6),-10px 0 0 #2a150a;
+ animation:fade 1.2s ease-out}
+.cover-title{font-family:Georgia,serif;color:#e8c872;text-align:center;font-size:2.3rem;
+ letter-spacing:.2em;text-shadow:0 2px 4px #000;margin-bottom:.3rem}
+.cover-sub{font-family:Georgia,serif;color:#d4a94a;text-align:center;font-style:italic;margin-bottom:1.5rem}
+[data-testid="stForm"] label p,[data-testid="stForm"] div[role="radiogroup"] p{color:#e8c872!important}
+[data-testid="stForm"] input{background:#f6ecd2;color:#2b1d12}
+[data-testid="stForm"] button,.stButton button{background:#d4a94a;color:#2a150a;border:none;font-weight:700}
+.book{perspective:1800px}
+.page{background:linear-gradient(90deg,#e9dcb8,#f8efd6 6%,#f6ecd2);color:#2b1d12;
+ font-family:Georgia,serif;padding:1.6rem 2rem;margin-bottom:1.2rem;border-radius:2px 10px 10px 2px;
+ box-shadow:inset 8px 0 14px -8px rgba(0,0,0,.35),4px 6px 14px rgba(0,0,0,.5);
+ transform-origin:left center;opacity:0;animation:flip .9s ease-out forwards}
+.page h1{font-size:1.9rem;margin:.3rem 0}
+.page h3{border-bottom:1px solid #b99a5a;padding-bottom:.4rem;color:#5a3418}
+.page a{color:#8a4b12;font-weight:bold}
+.page .bk{border-bottom:1px dotted #b99a5a;padding:.6rem 0}
+.page .warn{background:#f1d9a8;border-left:4px solid #a4561b;padding:.7rem 1rem}
+.page small{color:#6b5a44}
+.loader{text-align:center;color:#e8c872;font-family:Georgia,serif;padding:2rem 0;perspective:900px}
+.lbook{position:relative;width:114px;height:84px;margin:0 auto 1rem;background:#6b3a1f;border-radius:3px}
+.lp{position:absolute;left:50%;top:2px;width:54px;height:80px;background:#f6ecd2;
+ border:1px solid #b99a5a;transform-origin:left center;animation:lf 1.5s infinite ease-in-out}
+.lp:nth-child(2){animation-delay:.25s}.lp:nth-child(3){animation-delay:.5s}
+@keyframes lf{0%{transform:rotateY(0)}60%,100%{transform:rotateY(-170deg)}}
+@keyframes flip{from{opacity:0;transform:rotateY(-100deg)}to{opacity:1;transform:rotateY(0)}}
+@keyframes fade{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:none}}
+</style>
+"""
+LOADER = ('<div class="loader"><div class="lbook"><div class="lp"></div><div class="lp"></div>'
+          '<div class="lp"></div></div>Opening the book...</div>')
+st.markdown(CSS, unsafe_allow_html=True)
+
+
+# ---------- helpers ----------
+def e(x):
+    return html.escape(" ".join(str(x).split()))
+
+
+def get_json(url, **params):
     try:
-        os.environ["GROQ_API_KEY"] = st.secrets["GROQ_API_KEY"]
+        r = requests.get(url, params=params, headers=UA, timeout=10)
+        return r.json() if r.status_code == 200 else {}
     except Exception:
-        st.error("Missing GROQ_API_KEY. Add it in App settings > Secrets.")
-        st.stop()
-
-AFFILIATE_TAG = "yourtrack-20"
-
-# ---------------------------------------------------------------
-# 2. AI components (cached so they load only once)
-# ---------------------------------------------------------------
-@st.cache_resource
-def init_ai():
-    Settings.llm = Groq(model="llama-3.1-8b-instant")
-    Settings.embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-small-en-v1.5")
-    Settings.node_parser = TokenTextSplitter(chunk_size=512, chunk_overlap=32)
-    return True
-
-init_ai()
-
-DATA_DIR = "./data"
-IMAGE_DIR = "./extracted_images"
-for folder in [DATA_DIR, IMAGE_DIR]:
-    os.makedirs(folder, exist_ok=True)
-
-COPYRIGHTED_TERMS = [
-    "harry potter", "percy jackson", "lord of the rings",
-    "hobbit", "stephen king", "twilight", "narnia",
-]
+        return {}
 
 
-def clear_old_assets():
-    for folder in [DATA_DIR, IMAGE_DIR]:
-        if os.path.exists(folder):
-            for f in os.listdir(folder):
-                try:
-                    os.remove(os.path.join(folder, f))
-                except Exception:
-                    pass
+def text_of(v):
+    if isinstance(v, dict):
+        v = v.get("value", "")
+    return (v or "").strip()
 
 
-@st.cache_resource(show_spinner="Reading and indexing document...")
-def build_query_engine(file_stamp):
-    """Builds the index once per file. file_stamp changes when the file changes."""
-    documents = SimpleDirectoryReader(DATA_DIR).load_data()
-    index = VectorStoreIndex.from_documents(documents)
-    return index.as_query_engine()
+@lru_cache(maxsize=256)
+def work_desc(key):
+    d = text_of(get_json(f"https://openlibrary.org{key}.json").get("description"))
+    return d.split("\n\n")[0][:600]
 
 
-# ---------------------------------------------------------------
-# 3. Page setup
-# ---------------------------------------------------------------
-st.set_page_config(page_title="AI Commercial Book Engine", layout="wide")
-st.title("📚 AI Multi-Source Book Hub & Monetized Finder")
-st.subheader("Search libraries, download papers, extract graphics, and generate legal summaries.")
+@lru_cache(maxsize=256)
+def wiki(title):
+    j = get_json("https://en.wikipedia.org/api/rest_v1/page/summary/"
+                 + requests.utils.quote(title.replace(" ", "_")))
+    return j.get("extract", "")
 
-with st.sidebar:
-    st.header("⚡ Commercial Dashboard")
-    st.success("Cloud Brain Active")
-    st.write("🔥 Monetization Layer Active via Amazon Associates")
 
-# ---------------------------------------------------------------
-# 4. Search module
-# ---------------------------------------------------------------
-st.markdown("### 🔍 Search & Gather Portal")
-search_input = st.text_input("Enter a Book Title, Author Name, or Research Topic:")
-search_btn = st.button("Execute Search Engine")
+def amazon(q):
+    return f"https://www.amazon.com/s?k={requests.utils.quote(q)}&tag={AFFILIATE_TAG}"
 
-if search_btn and search_input:
-    clear_old_assets()
-    build_query_engine.clear()
-    query_lower = search_input.lower()
 
-    # CHECK 1: copyright protection
-    if any(term in query_lower for term in COPYRIGHTED_TERMS):
-        st.warning(
-            "⚠️ **Copyright Protection Triggered:** Direct downloading restricted. "
-            "Showing catalog info instead..."
-        )
+def free_link(d, title):
+    ia = d.get("ia") or []
+    if d.get("public_scan_b") and ia and not any(t in title.lower() for t in COPYRIGHTED_TERMS):
+        return f"https://archive.org/details/{ia[0]}"
+    return None
 
-        encoded_query = requests.utils.quote(search_input)
-        ol_url = f"https://openlibrary.org/search.json?q={encoded_query}&limit=1"
 
-        display_title = search_input.title()
-        display_author = ""
-        summary_found = False
+COPY_NOTE = ('<div class="warn">⚠️ <b>Copyright protected.</b> No free copy is offered here. '
+             'Please buy an official copy.</div>')
+DISCLOSE = "<small>As an Amazon Associate I earn from qualifying purchases.</small>"
 
-        try:
-            ol_res = requests.get(ol_url, timeout=10)
-            if ol_res.status_code == 200:
-                json_data = ol_res.json()
-                if json_data.get("docs"):
-                    book_data = json_data["docs"][0]
-                    display_title = book_data.get("title", display_title)
-                    display_author = ", ".join(book_data.get("author_name", ["Unknown Author"]))
-                    first_publish = book_data.get("first_publish_year", "N/A")
 
-                    st.markdown(f"#### 📖 **Book Profile: {display_title}**")
-                    st.markdown(f"* **Author:** {display_author}")
-                    st.markdown(f"* **First Published:** {first_publish}")
-                    summary_found = True
-        except Exception:
-            pass
+def buy_page(query):
+    return ("Where to buy", f'<p>🛒 <a href="{amazon(query)}" target="_blank">Buy on Amazon</a></p>{DISCLOSE}')
 
-        # Wikipedia summary
-        wiki_title = requests.utils.quote(display_title.replace(" ", "_"))
-        wiki_api_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{wiki_title}"
-        try:
-            wiki_res = requests.get(
-                wiki_api_url, timeout=10, headers={"User-Agent": "BookHubApp/1.0"}
-            )
-            if wiki_res.status_code == 200:
-                extract = wiki_res.json().get("extract", "No explicit summary found.")
-                if not summary_found:
-                    st.markdown(f"#### 📖 **Book Profile: {display_title}**")
-                st.info(f"**Brief Encyclopedic Summary:** {extract}")
-            else:
-                st.error("Could not find details for this title in the catalogs.")
-        except Exception as e:
-            st.error(f"Error reading library databases: {e}")
 
-        amazon_query = requests.utils.quote(f"{display_title} {display_author}".strip())
-        amazon_search_url = f"https://www.amazon.com/s?k={amazon_query}&tag={AFFILIATE_TAG}"
-        st.markdown(
-            f"🛒 **[Buy Official Copy on Amazon]({amazon_search_url})** "
-            "*(Affiliate Link - Earn Commissions)*"
-        )
+def not_found():
+    return [("Not found", "<p>Nothing matched your search. Try different words.</p>")]
 
-    # CHECK 2: open academic papers from arXiv
-    else:
-        st.info("Searching open-access repositories...")
-        payload = {"search_query": f'all:"{search_input}"', "max_results": 1}
-        api_url = "http://export.arxiv.org/api/query"
 
-        with st.spinner("Searching and downloading..."):
-            try:
-                response = requests.get(api_url, params=payload, timeout=15)
-                root = ET.fromstring(response.content)
-                ns = {"atom": "http://www.w3.org/2005/Atom"}
+# ---------- searches ----------
+def search_book(q):
+    docs = get_json("https://openlibrary.org/search.json", q=q, limit=1,
+                    fields="key,title,author_name,first_publish_year,ia,public_scan_b").get("docs", [])
+    if not docs:
+        return not_found()
+    d = docs[0]
+    title = d.get("title", q)
+    author = ", ".join(d.get("author_name", ["Unknown author"]))
+    desc = work_desc(d["key"]) or wiki(title) or "No description available."
+    link = free_link(d, title)
+    read = (f'<p>📄 <a href="{link}" target="_blank">Read / download the PDF (free)</a></p>'
+            if link else COPY_NOTE)
+    return [
+        ("", f'<div style="text-align:center"><h1>{e(title)}</h1><p><i>by {e(author)}</i></p>'
+             f'<p>First published {e(d.get("first_publish_year", "N/A"))}</p></div>'),
+        ("Contents", "<ol><li>About this book</li><li>Read it / PDF link</li><li>Where to buy</li></ol>"),
+        ("About this book", f"<p>{e(desc)}</p>"),
+        ("Read it", read),
+        buy_page(f"{title} {author}"),
+    ]
 
-                pdf_link = None
-                for entry in root.findall("atom:entry", ns):
-                    for link in entry.findall("atom:link", ns):
-                        if link.get("title") == "pdf":
-                            pdf_link = link.get("href")
-                            break
 
-                if pdf_link:
-                    if pdf_link.startswith("http://"):
-                        pdf_link = pdf_link.replace("http://", "https://", 1)
-                    target_path = os.path.join(DATA_DIR, "active_document.pdf")
-                    download_res = requests.get(pdf_link, timeout=30)
-                    with open(target_path, "wb") as f:
-                        f.write(download_res.content)
-                    st.success("🎉 Free document downloaded!")
+def search_author(q):
+    a = get_json("https://openlibrary.org/search/authors.json", q=q, limit=1).get("docs", [])
+    if not a:
+        return not_found()
+    a = a[0]
+    name = a.get("name", q)
+    bio = text_of(get_json(f"https://openlibrary.org/authors/{a['key']}.json").get("bio")) or wiki(name)
+    docs = get_json("https://openlibrary.org/search.json", author=name, limit=12, sort="editions",
+                    fields="key,title,first_publish_year,ia,public_scan_b").get("docs", [])
+    books, seen = [], set()
+    for b in docs:
+        t = b.get("title", "").lower()
+        if t and t not in seen:
+            seen.add(t)
+            books.append(b)
+    books = books[:10]
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        descs = list(ex.map(lambda b: work_desc(b["key"]), books))
+    cards = ""
+    for i, (b, d) in enumerate(zip(books, descs), 1):
+        link = free_link(b, b["title"])
+        status = (f'<a href="{link}" target="_blank">📄 Free PDF / read online</a>' if link
+                  else "<small>© Copyright protected</small>")
+        cards += (f'<div class="bk"><b>{i}. {e(b["title"])}</b> <small>({e(b.get("first_publish_year", "n/a"))})</small>'
+                  f'<br>{e(d) if d else "<small>No description available.</small>"}<br>{status}</div>')
+    life = " - ".join(x for x in [a.get("birth_date", ""), a.get("death_date", "")] if x)
+    toc = "".join(f"<li>{e(b['title'])}</li>" for b in books)
+    return [
+        ("", f'<div style="text-align:center"><h1>{e(name)}</h1><p><i>{e(life)}</i></p>'
+             f'<p>{e(a.get("work_count", ""))} works listed</p></div>'),
+        ("Index of books", f"<ol>{toc}</ol>"),
+        ("About the author", f"<p>{e(bio[:900]) if bio else 'No biography available.'}</p>"),
+        ("Their books", cards or "<p>No books found.</p>"),
+        buy_page(f"{name} books"),
+    ]
 
-                    reader_pdf = PdfReader(target_path)
-                    img_count = 0
-                    for page_num, page in enumerate(reader_pdf.pages):
-                        try:
-                            for image_file_object in page.images:
-                                img_path = os.path.join(
-                                    IMAGE_DIR,
-                                    f"extracted_p{page_num + 1}_{img_count}_{image_file_object.name}",
-                                )
-                                with open(img_path, "wb") as fp:
-                                    fp.write(image_file_object.data)
-                                img_count += 1
-                        except Exception:
-                            continue
-                    if img_count > 0:
-                        st.write(f"✨ Extracted **{img_count} images** from the document!")
-                else:
-                    st.warning("Could not find a matching paper on arXiv.")
-            except Exception as e:
-                st.error(f"Data retrieval error: {e}")
 
-# ---------------------------------------------------------------
-# 5. Chat + gallery tabs
-# ---------------------------------------------------------------
-st.markdown("---")
-tab1, tab2 = st.tabs(["💬 Document Chatbot", "🖼️ Extracted Photo Gallery"])
+def search_paper(q):
+    try:
+        r = requests.get("https://export.arxiv.org/api/query",
+                         params={"search_query": f'all:"{q}"', "max_results": 1}, timeout=15)
+        ns = {"a": "http://www.w3.org/2005/Atom"}
+        en = ET.fromstring(r.content).find("a:entry", ns)
+    except Exception:
+        en = None
+    if en is None:
+        return not_found()
+    title = en.find("a:title", ns).text
+    summ = en.find("a:summary", ns).text
+    auth = ", ".join(x.find("a:name", ns).text for x in en.findall("a:author", ns))
+    pdf = next((l.get("href") for l in en.findall("a:link", ns) if l.get("title") == "pdf"), None)
+    pdf = pdf.replace("http://", "https://") if pdf else None
+    return [
+        ("", f'<div style="text-align:center"><h1>{e(title)}</h1><p><i>{e(auth)}</i></p></div>'),
+        ("Summary", f"<p>{e(summ)[:900]}</p>"),
+        ("Read it", f'<p>📄 <a href="{pdf}" target="_blank">Open the free PDF</a></p>' if pdf
+         else "<p>No PDF link found.</p>"),
+    ]
 
-with tab1:
-    st.markdown("### Interactive Workspace")
-    files = os.listdir(DATA_DIR) if os.path.exists(DATA_DIR) else []
 
-    if files:
-        pdf_path = os.path.join(DATA_DIR, files[0])
-        file_stamp = f"{files[0]}-{os.path.getmtime(pdf_path)}"
-        query_engine = build_query_engine(file_stamp)
+def render(pages):
+    out = '<div class="book">'
+    for i, (head, body) in enumerate(pages):
+        h = f"<h3>{head}</h3>" if head else ""
+        out += f'<div class="page" style="animation-delay:{i * 0.5}s">{h}{body}</div>'
+    return out + "</div>"
 
-        user_question = st.text_input("Ask a question about your document:")
-        if user_question:
-            with st.spinner("AI is thinking..."):
-                try:
-                    res = query_engine.query(user_question)
-                    st.markdown(f"**Bot Answer:** {res}")
-                except Exception as e:
-                    st.error(f"AI error: {e}")
-    else:
-        st.info("No document loaded yet. Run a search above.")
 
-with tab2:
-    st.markdown("### Document Graphics Gallery")
-    image_files = os.listdir(IMAGE_DIR) if os.path.exists(IMAGE_DIR) else []
-
-    if image_files:
-        cols = st.columns(3)
-        for idx, img_file in enumerate(image_files):
-            img_path = os.path.join(IMAGE_DIR, img_file)
-            try:
-                cols[idx % 3].image(img_path, caption=img_file, use_container_width=True)
-            except Exception:
-                pass
-    else:
-        st.info("No images extracted yet.")
+# ---------- app ----------
+if "pages" in st.session_state:
+    st.markdown(render(st.session_state["pages"]), unsafe_allow_html=True)
+    if st.button("📕 Close book"):
+        del st.session_state["pages"]
+        st.rerun()
+else:
+    with st.form("cover"):
+        st.markdown('<div class="cover-title">THE BOOK HUB</div>'
+                    '<div class="cover-sub">✦ Find any book, author or paper ✦</div>',
+                    unsafe_allow_html=True)
+        mode = st.radio("Search for", ["Book", "Author", "Research paper"], horizontal=True)
+        q = st.text_input("Type a title, name or topic")
+        go = st.form_submit_button("Open the book 📖")
+    if go and q.strip():
+        ph = st.empty()
+        ph.markdown(LOADER, unsafe_allow_html=True)
+        fn = {"Book": search_book, "Author": search_author, "Research paper": search_paper}[mode]
+        pages = fn(q.strip())
+        ph.empty()
+        st.session_state["pages"] = pages
+        st.rerun()
