@@ -1,7 +1,2 @@
 streamlit
 requests
-pypdf
-Pillow
-llama-index-core
-llama-index-llms-groq
-llama-index-embeddings-huggingface
